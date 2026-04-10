@@ -1,0 +1,27 @@
+[package]
+name = "stylemd"
+version = "0.2.0"
+edition = "2021"
+description = "Markdown styling toolkit — lint, format, fix, and polish your prose"
+license = "MIT"
+repository = "https://github.com/leaf-kit/style.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+regex = "1"
+glob = "0.3"
+similar = "2"
+reqwest = { version = "0.12", features = ["blocking"] }
+notify = "6"
+serde_json = "1"
+serde_yaml = "0.9"
+atty = "0.2"
+walkdir = "2"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = 3

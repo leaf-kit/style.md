@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Run tests
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo test --verbose
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          BINARY=stylemd
+          ARCHIVE="stylemd-${{ matrix.target }}.tar.gz"
+          STAGING=$(mktemp -d)
+
+          cp "target/${{ matrix.target }}/release/${BINARY}" "$STAGING/"
+          cp README.md README_en.md LICENSE "$STAGING/" 2>/dev/null || true
+
+          tar -czf "$ARCHIVE" -C "$STAGING" .
+          rm -rf "$STAGING"
+
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stylemd-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          find artifacts -name "*.tar.gz" -exec cp {} release/ \;
+          ls -la release/
+
+          echo "## SHA256 Checksums" > release/CHECKSUMS.txt
+          echo "" >> release/CHECKSUMS.txt
+          cd release
+          for f in *.tar.gz; do
+            sha256sum "$f" >> CHECKSUMS.txt
+          done
+          cat CHECKSUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/CHECKSUMS.txt
+          generate_release_notes: true
+
+  update-formula:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binaries and compute SHA256
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          BASE="https://github.com/leaf-kit/style.md/releases/download/${TAG}"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt $attempt: downloading binaries..."
+
+            curl -sL "${BASE}/stylemd-aarch64-apple-darwin.tar.gz" -o mac_arm.tar.gz
+            curl -sL "${BASE}/stylemd-x86_64-apple-darwin.tar.gz" -o mac_x86.tar.gz
+            curl -sL "${BASE}/stylemd-x86_64-unknown-linux-gnu.tar.gz" -o linux_x86.tar.gz
+            curl -sL "${BASE}/stylemd-aarch64-unknown-linux-gnu.tar.gz" -o linux_arm.tar.gz
+
+            MAC_ARM_SIZE=$(stat -c%s mac_arm.tar.gz 2>/dev/null || echo 0)
+            if [ "$MAC_ARM_SIZE" -gt 1000 ]; then
+              echo "Downloads OK"
+              break
+            fi
+            echo "Downloads incomplete, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "SHA_MAC_ARM=$(sha256sum mac_arm.tar.gz | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "SHA_MAC_X86=$(sha256sum mac_x86.tar.gz | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "SHA_LINUX_X86=$(sha256sum linux_x86.tar.gz | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "SHA_LINUX_ARM=$(sha256sum linux_arm.tar.gz | awk '{print $1}')" >> "$GITHUB_ENV"
+
+          echo "  mac-arm64:   $(sha256sum mac_arm.tar.gz)"
+          echo "  mac-x86_64:  $(sha256sum mac_x86.tar.gz)"
+          echo "  linux-x86:   $(sha256sum linux_x86.tar.gz)"
+          echo "  linux-arm64: $(sha256sum linux_arm.tar.gz)"
+
+      - name: Generate Formula
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="leaf-kit/style.md"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          mkdir -p Formula
+          cat > Formula/stylemd.rb << EOF
+          class Stylemd < Formula
+            desc "Markdown styling toolkit — lint, format, fix, and polish your prose"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE}/stylemd-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "${BASE}/stylemd-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${BASE}/stylemd-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "${BASE}/stylemd-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "stylemd"
+            end
+
+            test do
+              assert_match "stylemd ${VERSION}", shell_output("\#{bin}/stylemd --version")
+
+              (testpath/"test.md").write("# Title\ntext   \n")
+              output = shell_output("\#{bin}/stylemd check \#{testpath}/test.md 2>&1")
+              assert_match "trailing", output.downcase
+
+              system bin/"stylemd", "init"
+              assert_predicate testpath/".stylemd.toml", :exist?
+            end
+          end
+          EOF
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' Formula/stylemd.rb
+          cat Formula/stylemd.rb
+
+      - name: Commit and push Formula
+        run: |
+          git config user.name "leaf-kit"
+          git config user.email ""
+          git add Formula/stylemd.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "Formula: update to ${GITHUB_REF_NAME} (binary)"
+            git push origin HEAD:main
+          fi
+
+      - name: Push to homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAP_DIR=$(mktemp -d)
+          if gh repo clone leaf-kit/homebrew-stylemd "$TAP_DIR" 2>/dev/null; then
+            mkdir -p "$TAP_DIR/Formula"
+            cp Formula/stylemd.rb "$TAP_DIR/Formula/stylemd.rb"
+            cd "$TAP_DIR"
+            git config user.name "leaf-kit"
+            git config user.email ""
+            git add Formula/stylemd.rb
+            if ! git diff --cached --quiet; then
+              git commit -m "Update stylemd to ${GITHUB_REF_NAME}"
+              git push origin main
+            fi
+          fi
+          rm -rf "$TAP_DIR"
